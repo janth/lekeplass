@@ -169,6 +169,53 @@ def pr_is_approved(pr_number: int, token: Optional[str]) -> Optional[bool]:
     return False
 
 
+def check_commit_signatures(base_ref: str, head_ref: str):
+    """
+    Check GPG signatures for commits in the range `base_ref..head_ref`.
+
+    Returns:
+      - None on error (git command failed)
+      - Empty list when all commits have valid signatures
+      - List of dicts for commits with missing or invalid signatures. Each dict
+        contains keys: sha, gstatus, gkey, gsigner, author, email, date, subject
+    """
+    # Use git's pretty format placeholders for signature info:
+    # %G? = signature status (G = good, B = bad, U = untrusted, N = no signature, etc.)
+    # %GK = key fingerprint (may be empty)
+    # %GS = signer (name/email)
+    fmt = "%H%x00%G?%x00%GK%x00%GS%x00%an%x00%ae%x00%ad%x00%s"
+    p = run(f"git log --pretty=format:{fmt} {base_ref}..{head_ref}")
+    if p.returncode != 0:
+        return None
+    out = p.stdout
+    if not out:
+        return []
+    lines = out.splitlines()
+    bad = []
+    for line in lines:
+        if not line:
+            continue
+        parts = line.split("\x00")
+        # ensure we have at least 8 parts
+        while len(parts) < 8:
+            parts.append("")
+        sha, gstatus, gkey, gsigner, author, email, date, subject = parts[:8]
+        if gstatus == "":
+            gstatus = "N"
+        if gstatus != "G":
+            bad.append({
+                "sha": sha,
+                "gstatus": gstatus,
+                "gkey": gkey,
+                "gsigner": gsigner,
+                "author": author,
+                "email": email,
+                "date": date,
+                "subject": subject,
+            })
+    return bad
+
+
 def main():
     try:
         root = repo_root()
@@ -198,6 +245,18 @@ def main():
         origin_ref = f"origin/{origin_default}"
         a2, b2 = ahead_behind("HEAD", origin_ref)
         print(f"Compared to origin default ({origin_ref}): ahead={a2}, behind={b2}")
+        # Check commit signatures for commits introduced on this branch
+        sigs = check_commit_signatures(origin_ref, "HEAD")
+        if sigs is None:
+            print("Could not determine commit signatures (git log failed).")
+        elif not sigs:
+            print("All commits from origin default to HEAD are signed and valid.")
+        else:
+            print("Unsigned or invalidly-signed commits between origin default and HEAD:")
+            for c in sigs:
+                print(f"- {c['sha']} | status={c['gstatus']} | key={c['gkey']} | signer={c['gsigner']}")
+                print(f"  {c['author']} <{c['email']}> | {c['date']}")
+                print(f"  {c['subject']}")
     else:
         print("Could not determine origin default branch.")
 
