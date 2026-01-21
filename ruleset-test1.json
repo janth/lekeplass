@@ -1,0 +1,78 @@
+{
+  "id": 11980045,
+  "name": "test1",
+  "target": "branch",
+  "source_type": "Repository",
+  "source": "jan-thomas-m/ruletestrepo",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "exclude": [
+
+      ],
+      "include": [
+        "~DEFAULT_BRANCH"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "type": "deletion"
+    },
+    {
+      "type": "non_fast_forward"
+    },
+    {
+      "type": "required_linear_history"
+    },
+    {
+      "type": "required_signatures"
+    },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 1,
+        "dismiss_stale_reviews_on_push": true,
+        "required_reviewers": [
+
+        ],
+        "require_code_owner_review": true,
+        "require_last_push_approval": true,
+        "required_review_thread_resolution": true,
+        "allowed_merge_methods": [
+          "squash",
+          "rebase"
+        ]
+      }
+    },
+    {
+      "type": "code_quality",
+      "parameters": {
+        "severity": "all"
+      }
+    },
+    {
+      "type": "code_scanning",
+      "parameters": {
+        "code_scanning_tools": [
+          {
+            "tool": "CodeQL",
+            "security_alerts_threshold": "all",
+            "alerts_threshold": "all"
+          }
+        ]
+      }
+    }
+  ],
+  "node_id": "RRS_lACqUmVwb3NpdG9yec5D2oiwzgC2zQ0",
+  "created_at": "2026-01-20T16:10:54.523Z",
+  "updated_at": "2026-01-20T16:10:54.586Z",
+  "_links": {
+    "self": {
+      "href": "https://api.github.com/repos/jan-thomas-m/ruletestrepo/rulesets/11980045"
+    },
+    "html": {
+      "href": "https://github.com/jan-thomas-m/ruletestrepo/rules/11980045"
+    }
+  }
+}
