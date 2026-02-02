@@ -8,12 +8,7 @@ from pathlib import Path
 import sys
 from typing import Optional, Tuple
 
-try:
-    import hcl2
-except ImportError as e:
-    print(f"Missing dependency 'hcl2': {e}")
-    print("Please install it via 'uv pip install python-hcl2'")
-    raise SystemExit(1)
+import hcl2
 
 
 def extract_aws_provider(file_path: Path) -> Optional[Tuple[str, str]]:

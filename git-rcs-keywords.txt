@@ -1,0 +1,15 @@
+.gitattributes
+
+# https://git-scm.com/book/en/v2/Customizing-Git-Git-Attributes#Keyword-Expansion
+# https://stackoverflow.com/questions/11856983/why-git-authordate-is-different-from-commitdate
+#
+# git config filter.rcskeywords.smudge 'perl -pe "s/\\\$Date\\\$/\\\$Date: $( git log --pretty=format:"%ai" -1 ) \\\$/; s/\\\$Id\\\$/\\\$Id: $( git log --pretty=format:"%h" -1 ) \\\$/;"'
+# git config filter.rcskeywords.clean 'perl -pe "s/\\\$Date[^\\\$]*\\\$/\\\$Date\\\$/; s/\\\$Id[^\\\$]*\\\$/\\\$Id\\\$/;"'
+*.txt  filter=rcskeywords
+
+
+testfile.txt
+# Header
+# $Id$
+# $Date$
+###
