@@ -25,25 +25,52 @@ except ImportError:  # pragma: no cover - runtime environment
 AWS_CONFIG = Path(os.path.expanduser("~")) / ".aws" / "config"
 
 
-def read_aws_config(path: Path) -> Dict[str, Dict[str, str]]:
+def read_aws_config(path: Path) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
+    """Read AWS config and return (profiles, sso_sessions).
+
+    - profiles: mapping of profile name -> options
+    - sso_sessions: mapping of session name -> options (from sections like '[sso-session NAME]')
+    """
     cp = configparser.RawConfigParser()
     if not path.exists():
         raise FileNotFoundError(f"AWS config not found at: {path}")
     cp.read(path)
     profiles: Dict[str, Dict[str, str]] = {}
+    sso_sessions: Dict[str, Dict[str, str]] = {}
     for section in cp.sections():
         name = section
         if name.startswith("profile "):
             name = name[len("profile "):]
-        profiles[name] = {k: v for k, v in cp.items(section)}
-    return profiles
+            profiles[name] = {k: v for k, v in cp.items(section)}
+        elif name.startswith("sso-session "):
+            # section header is 'sso-session NAME'
+            sess = name[len("sso-session "):]
+            sso_sessions[sess] = {k: v for k, v in cp.items(section)}
+        else:
+            # keep other sections as profiles (eg 'default')
+            profiles[name] = {k: v for k, v in cp.items(section)}
+    return profiles, sso_sessions
 
 
-def summarize_profiles(profiles: Dict[str, Dict[str, str]]) -> List[Tuple[str, str, str]]:
+def resolve_sso_conf(profile_conf: Dict[str, str], sso_sessions: Dict[str, Dict[str, str]]) -> Dict[str, str]:
+    """Return a merged configuration where session keys fill missing profile sso values."""
+    out = dict(profile_conf)
+    session_name = profile_conf.get("sso_session")
+    if session_name:
+        sess = sso_sessions.get(session_name)
+        if sess:
+            # session values should not override explicit profile values
+            for k, v in sess.items():
+                out.setdefault(k, v)
+    return out
+
+
+def summarize_profiles(profiles: Dict[str, Dict[str, str]], sso_sessions: Dict[str, Dict[str, str]]) -> List[Tuple[str, str, str]]:
     out: List[Tuple[str, str, str]] = []
     for name, data in sorted(profiles.items()):
-        acct = data.get("sso_account_id") or data.get("sso_account") or "-"
-        role = data.get("sso_role_name") or data.get("role_name") or data.get("role_arn", "-")
+        merged = resolve_sso_conf(data, sso_sessions)
+        acct = merged.get("sso_account_id") or merged.get("sso_account") or "-"
+        role = merged.get("sso_role_name") or merged.get("role_name") or merged.get("role_arn") or "-"
         out.append((name, acct, role))
     return out
 
@@ -71,15 +98,17 @@ def choose_profile(items: List[Tuple[str, str, str]]) -> Optional[str]:
 
 
 def profile_is_sso(profile_conf: Dict[str, str]) -> bool:
-    return any(k.startswith("sso_") for k in profile_conf.keys())
+    # SSO profile may either have 'sso_*' keys or an 'sso_session' reference
+    return any(k.startswith("sso_") for k in profile_conf.keys()) or ("sso_session" in profile_conf)
 
 
 def verify_profile_with_boto3(profile_name: str, extra_session_kwargs: Optional[Dict] = None) -> bool:
     try:
-        session_args = {"profile_name": profile_name}
         if extra_session_kwargs:
-            session_args.update(extra_session_kwargs)
-        session = boto3.Session(**session_args)
+            # When given explicit temporary credentials, use them directly
+            session = boto3.Session(**extra_session_kwargs)
+        else:
+            session = boto3.Session(profile_name=profile_name)
         sts = session.client("sts")
         ident = sts.get_caller_identity()
         print("Caller identity:")
@@ -97,6 +126,7 @@ def verify_profile_with_boto3(profile_name: str, extra_session_kwargs: Optional[
 
 
 def sso_device_flow_login(profile_name: str, profile_conf: Dict[str, str]) -> bool:
+    # profile_conf should already be merged with its sso-session.
     start_url = profile_conf.get("sso_start_url") or profile_conf.get("sso_starturl")
     sso_region = profile_conf.get("sso_region")
     account_id = profile_conf.get("sso_account_id") or profile_conf.get("sso_account")
@@ -192,12 +222,12 @@ def sso_device_flow_login(profile_name: str, profile_conf: Dict[str, str]) -> bo
 
 def main() -> int:
     try:
-        profiles = read_aws_config(AWS_CONFIG)
+        profiles, sso_sessions = read_aws_config(AWS_CONFIG)
     except FileNotFoundError as e:
         print(e)
         return 2
 
-    items = summarize_profiles(profiles)
+    items = summarize_profiles(profiles, sso_sessions)
     if not items:
         print("No profiles found in ~/.aws/config")
         return 1
@@ -209,11 +239,12 @@ def main() -> int:
         return 0
 
     conf = profiles.get(selected, {})
+    merged_conf = resolve_sso_conf(conf, sso_sessions)
     print(f"Selected profile: {selected}")
 
-    if profile_is_sso(conf):
+    if profile_is_sso(merged_conf):
         print("Detected SSO profile. Attempting SSO device authorization flow (via boto3)...")
-        ok = sso_device_flow_login(selected, conf)
+        ok = sso_device_flow_login(selected, merged_conf)
         return 0 if ok else 1
     else:
         print("Profile does not appear to be SSO-configured. Verifying credentials using boto3...")
