@@ -345,10 +345,20 @@ def _is_commit_ancestor(cc, repo_name: str, ancestor: str, descendant: str, cach
 
 
 def codecommit(repo_name: str, branch: Optional[str] = None, max_files: int = 1000, session: Optional[boto3.Session] = None) -> int:
-    if session is None:
-        cc = boto3.client("codecommit")
-    else:
-        cc = session.client("codecommit")
+    try:
+        if session is None:
+            cc = boto3.client("codecommit")
+        else:
+            cc = session.client("codecommit")
+    except boto_exceptions.NoCredentialsError:
+        print("No AWS credentials available for CodeCommit. Provide a profile or credentials.")
+        return 2
+    except boto_exceptions.ClientError as e:
+        print("Failed to create CodeCommit client:", e)
+        return 2
+    except Exception as e:  # pragma: no cover - defensive
+        print("Unexpected error creating CodeCommit client:", e)
+        return 2
     # Get repository and default branch if needed
     try:
         repo = cc.get_repository(repositoryName=repo_name)["repositoryMetadata"]
