@@ -449,39 +449,39 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="aws-grok", description="Interact with AWS profiles and CodeCommit")
     sub = parser.add_subparsers(dest="cmd")
     sub.add_parser("list-profiles")
-    cc_parser = sub.add_parser("codecommit")
-    cc_parser.add_argument("repository", help="CodeCommit repository name")
-    cc_parser.add_argument("--branch", help="Branch name (defaults to repo default)")
-    cc_parser.add_argument("--max-files", type=int, default=1000, help="Max number of files to process")
+    # cc_parser = sub.add_parser("codecommit")
+    # cc_parser.add_argument("repository", help="CodeCommit repository name")
+    # cc_parser.add_argument("--branch", help="Branch name (defaults to repo default)")
+    # cc_parser.add_argument("--max-files", type=int, default=1000, help="Max number of files to process")
     cc_parser.add_argument("--profile", "-p", help="AWS profile to use (will login first if SSO)")
 
     args, unknown = parser.parse_known_args()
 
-    if args.cmd == "codecommit":
-        # If a profile is supplied, attempt to login (SSO if needed) and create a session for CodeCommit
-        session = None
-        if getattr(args, "profile", None):
-            try:
-                profiles, sso_sessions = read_aws_config(AWS_CONFIG)
-            except FileNotFoundError as e:
-                print(e)
-                return 2
-            if args.profile not in profiles:
-                print(f"Profile '{args.profile}' not found in ~/.aws/config")
-                return 2
-            conf = profiles.get(args.profile, {})
-            merged_conf = resolve_sso_conf(conf, sso_sessions)
-            if profile_is_sso(merged_conf):
-                print("SSO profile detected; initiating login...")
-                creds = sso_device_flow_login(args.profile, merged_conf)
-                if not creds:
-                    print("SSO login failed or cancelled.")
-                    return 1
-                session = boto3.Session(aws_access_key_id=creds.get("aws_access_key_id"), aws_secret_access_key=creds.get("aws_secret_access_key"), aws_session_token=creds.get("aws_session_token"))
-            else:
-                # Non-SSO: try to create session from profile (assumes credentials in config/credentials)
-                session = boto3.Session(profile_name=args.profile)
-        return codecommit(args.repository, branch=args.branch, max_files=args.max_files, session=session)
+    # if args.cmd == "codecommit":
+    #     # If a profile is supplied, attempt to login (SSO if needed) and create a session for CodeCommit
+    #     session = None
+    #     if getattr(args, "profile", None):
+    #         try:
+    #             profiles, sso_sessions = read_aws_config(AWS_CONFIG)
+    #         except FileNotFoundError as e:
+    #             print(e)
+    #             return 2
+    #         if args.profile not in profiles:
+    #             print(f"Profile '{args.profile}' not found in ~/.aws/config")
+    #             return 2
+    #         conf = profiles.get(args.profile, {})
+    #         merged_conf = resolve_sso_conf(conf, sso_sessions)
+    #         if profile_is_sso(merged_conf):
+    #             print("SSO profile detected; initiating login...")
+    #             creds = sso_device_flow_login(args.profile, merged_conf)
+    #             if not creds:
+    #                 print("SSO login failed or cancelled.")
+    #                 return 1
+    #             session = boto3.Session(aws_access_key_id=creds.get("aws_access_key_id"), aws_secret_access_key=creds.get("aws_secret_access_key"), aws_session_token=creds.get("aws_session_token"))
+    #         else:
+    #             # Non-SSO: try to create session from profile (assumes credentials in config/credentials)
+    #             session = boto3.Session(profile_name=args.profile)
+    #     return codecommit(args.repository, branch=args.branch, max_files=args.max_files, session=session)
 
     # interactive profile selection (default behavior)
     try:
@@ -519,7 +519,17 @@ def main() -> int:
         print(f"  aws configure sso --profile {selected}")
         print("Or configure static credentials with 'aws configure --profile <name>'.")
         return 1
+    print("Done login process, session token is:", creds.get("aws_session_token"))
+    print("You can now use AWS CLI or SDKs with this profile.")
+    print("To set environment variables for this session, run:")
+    print(f"  export AWS_ACCESS_KEY_ID={creds.get('aws_access_key_id')}")
+    print(f"  export AWS_SECRET_ACCESS_KEY={creds.get('aws_secret_access_key')}")
+    print(f"  export AWS_SESSION_TOKEN={creds.get('aws_session_token')}")
+    print("Or configure your AWS SDK to use these temporary credentials.")
 
+    print("Now doing CodeCommit operation...")
+    codecommit("my-repo", branch="main", max_files=1000)
+    return 0
 
 if __name__ == "__main__":
     sys.exit(main())
