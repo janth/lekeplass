@@ -14,6 +14,8 @@ import time
 import webbrowser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import argparse
+from datetime import datetime, timezone
 
 try:
     import boto3
@@ -220,7 +222,229 @@ def sso_device_flow_login(profile_name: str, profile_conf: Dict[str, str]) -> bo
     return ok
 
 
+# --------------------------- CodeCommit helpers ---------------------------
+def _iso_to_dt(s: str) -> datetime:
+    # AWS commit dates look like '2021-01-01T12:00:00Z' — convert to timezone-aware
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def _rel_time(dt: datetime) -> str:
+    now = datetime.now(timezone.utc)
+    delta = now - dt
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    days = hours // 24
+    if days < 7:
+        return f"{days}d ago"
+    weeks = days // 7
+    return f"{weeks}w ago"
+
+
+def _list_all_files(cc, repo_name: str, commit_spec: str) -> List[str]:
+    files: List[str] = []
+    # BFS over folders
+    queue = ["/"]
+    while queue:
+        path = queue.pop(0)
+        try:
+            resp = cc.get_folder(repositoryName=repo_name, commitSpecifier=commit_spec, folderPath=path)
+        except cc.exceptions.FolderDoesNotExistException:
+            continue
+        for f in resp.get("files", []):
+            p = f.get("absolutePath") or f.get("relativePath") or ""
+            if p.startswith("/"):
+                p = p[1:]
+            files.append(p)
+        for sub in resp.get("subFolders", []):
+            sp = sub.get("absolutePath") or sub.get("relativePath") or ""
+            queue.append(sp)
+    return sorted(files)
+
+
+def _find_last_commit_for_file(cc, repo_name: str, head_commit: str, file_path: str, cache: Dict[str, dict]) -> Optional[str]:
+    # Walk commits from head backwards and find the first commit that changed file_path
+    commit_id = head_commit
+    checked = 0
+    while commit_id and checked < 2000:
+        checked += 1
+        if commit_id in cache:
+            commit = cache[commit_id]
+        else:
+            commit = cc.get_commit(repositoryName=repo_name, commitId=commit_id)["commit"]
+            cache[commit_id] = commit
+        parents = commit.get("parents", [])
+        if not parents:
+            # root commit; assume it introduced the file if present
+            return commit_id
+        parent = parents[0]
+        # check differences between parent and commit
+        try:
+            diffs = cc.get_differences(repositoryName=repo_name, beforeCommitSpecifier=parent, afterCommitSpecifier=commit_id)
+        except Exception:
+            # fall back to assuming this commit
+            return commit_id
+        found = False
+        for d in diffs.get("differences", []):
+            after = d.get("afterBlob") or {}
+            before = d.get("beforeBlob") or {}
+            paths = [after.get("path"), before.get("path"), d.get("afterPath"), d.get("beforePath")]
+            for p in paths:
+                if not p:
+                    continue
+                p_clean = p[1:] if p.startswith("/") else p
+                if p_clean == file_path:
+                    found = True
+                    break
+            if found:
+                break
+        if found:
+            return commit_id
+        commit_id = parent
+    return None
+
+
+def _is_commit_ancestor(cc, repo_name: str, ancestor: str, descendant: str, cache: Dict[str, dict]) -> bool:
+    # walk parents from descendant to see if we hit ancestor
+    to_visit = [descendant]
+    visited = set()
+    steps = 0
+    while to_visit and steps < 5000:
+        cur = to_visit.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        if cur == ancestor:
+            return True
+        if cur in cache:
+            parents = cache[cur].get("parents", [])
+        else:
+            try:
+                c = cc.get_commit(repositoryName=repo_name, commitId=cur)["commit"]
+            except Exception:
+                parents = []
+            else:
+                cache[cur] = c
+                parents = c.get("parents", [])
+        to_visit.extend(parents)
+        steps += 1
+    return False
+
+
+def codecommit(repo_name: str, branch: Optional[str] = None, max_files: int = 1000) -> int:
+    cc = boto3.client("codecommit")
+    # Get repository and default branch if needed
+    try:
+        repo = cc.get_repository(repositoryName=repo_name)["repositoryMetadata"]
+    except Exception as e:
+        print("Failed to get repository:", e)
+        return 2
+    default_branch = repo.get("defaultBranch")
+    if not branch:
+        branch = default_branch or "main"
+
+    try:
+        br = cc.get_branch(repositoryName=repo_name, branchName=branch)["branch"]
+        head_commit = br.get("commitId")
+    except Exception as e:
+        print("Failed to determine head commit for branch:", e)
+        return 2
+
+    print(f"Repository: {repo_name} (branch: {branch}, head: {head_commit})")
+
+    files = _list_all_files(cc, repo_name, head_commit)
+    if not files:
+        print("No files found in repository at head commit")
+        return 1
+    if len(files) > max_files:
+        print(f"Repository has {len(files)} files; limiting to first {max_files}")
+        files = files[:max_files]
+
+    # Preload pull requests for the repo
+    pr_ids = []
+    try:
+        resp = cc.list_pull_requests(repositoryName=repo_name)
+        pr_ids = resp.get("pullRequestIds", [])
+    except Exception:
+        pr_ids = []
+
+    prs = {}
+    for pr_id in pr_ids:
+        try:
+            p = cc.get_pull_request(pullRequestId=pr_id)["pullRequest"]
+            prs[pr_id] = p
+        except Exception:
+            continue
+
+    commit_cache: Dict[str, dict] = {}
+
+    print("\nFile | commit | author | date (iso) | ago | message | pull_request")
+    print("----|--------|--------|-----------|-----|---------|-------------")
+    for f in files:
+        last = _find_last_commit_for_file(cc, repo_name, head_commit, f, commit_cache)
+        if not last:
+            cshort = "-"
+            author = "-"
+            datestr = "-"
+            rel = "-"
+            msg = "-"
+            pr_list = []
+        else:
+            commit = commit_cache.get(last) or cc.get_commit(repositoryName=repo_name, commitId=last)["commit"]
+            commit_cache[last] = commit
+            cshort = last[:7]
+            author = commit.get("author", {}).get("name") or commit.get("committer", {}).get("name") or "-"
+            date_raw = commit.get("committer", {}).get("date") or commit.get("author", {}).get("date")
+            dt = _iso_to_dt(date_raw) if date_raw else datetime.now(timezone.utc)
+            datestr = dt.isoformat()
+            rel = _rel_time(dt)
+            msg = (commit.get("message") or "").splitlines()[0]
+            pr_list = []
+            # find PRs that include this commit (heuristic: commit is ancestor of sourceCommit)
+            for pr_id, pr in prs.items():
+                for tgt in pr.get("pullRequestTargets", []):
+                    src = tgt.get("sourceCommit")
+                    dst = tgt.get("destinationCommit")
+                    if not src:
+                        continue
+                    try:
+                        if _is_commit_ancestor(cc, repo_name, last, src, commit_cache):
+                            pr_list.append((pr_id, pr.get("title")))
+                            break
+                    except Exception:
+                        continue
+        pr_text = "; ".join([f"{pid} ({(title or '')[:40]})" for pid, title in pr_list]) or "-"
+        print(f"{f} | {cshort} | {author} | {datestr} | {rel} | {msg} | {pr_text}")
+
+    return 0
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(prog="aws-grok", description="Interact with AWS profiles and CodeCommit")
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("list-profiles")
+    cc_parser = sub.add_parser("codecommit")
+    cc_parser.add_argument("repository", help="CodeCommit repository name")
+    cc_parser.add_argument("--branch", help="Branch name (defaults to repo default)")
+    cc_parser.add_argument("--max-files", type=int, default=1000, help="Max number of files to process")
+
+    args, unknown = parser.parse_known_args()
+
+    if args.cmd == "codecommit":
+        return codecommit(args.repository, branch=args.branch, max_files=args.max_files)
+
+    # interactive profile selection (default behavior)
     try:
         profiles, sso_sessions = read_aws_config(AWS_CONFIG)
     except FileNotFoundError as e:
