@@ -448,12 +448,12 @@ def codecommit(repo_name: str, branch: Optional[str] = None, max_files: int = 10
 def main() -> int:
     parser = argparse.ArgumentParser(prog="aws-grok", description="Interact with AWS profiles and CodeCommit")
     sub = parser.add_subparsers(dest="cmd")
-    sub.add_parser("list-profiles")
+    prof_parser = sub.add_parser("list-profiles")
+    prof_parser.add_argument("--profile", "-p", help="AWS profile to use (will login first if SSO)")
     # cc_parser = sub.add_parser("codecommit")
     # cc_parser.add_argument("repository", help="CodeCommit repository name")
     # cc_parser.add_argument("--branch", help="Branch name (defaults to repo default)")
     # cc_parser.add_argument("--max-files", type=int, default=1000, help="Max number of files to process")
-    cc_parser.add_argument("--profile", "-p", help="AWS profile to use (will login first if SSO)")
 
     args, unknown = parser.parse_known_args()
 
@@ -508,7 +508,8 @@ def main() -> int:
     if profile_is_sso(merged_conf):
         print("Detected SSO profile. Attempting SSO device authorization flow (via boto3)...")
         creds = sso_device_flow_login(selected, merged_conf)
-        return 0 if creds else 1
+        if not creds:
+            return 1
     else:
         print("Profile does not appear to be SSO-configured. Verifying credentials using boto3...")
         ok = verify_profile_with_boto3(selected)
@@ -519,6 +520,7 @@ def main() -> int:
         print(f"  aws configure sso --profile {selected}")
         print("Or configure static credentials with 'aws configure --profile <name>'.")
         return 1
+
     print("Done login process, session token is:", creds.get("aws_session_token"))
     print("You can now use AWS CLI or SDKs with this profile.")
     print("To set environment variables for this session, run:")
@@ -528,7 +530,7 @@ def main() -> int:
     print("Or configure your AWS SDK to use these temporary credentials.")
 
     print("Now doing CodeCommit operation...")
-    codecommit("my-repo", branch="main", max_files=1000)
+    codecommit("aws-accelerator-config", branch="main", max_files=1000)
     return 0
 
 if __name__ == "__main__":
