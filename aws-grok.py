@@ -58,12 +58,19 @@ def resolve_sso_conf(profile_conf: Dict[str, str], sso_sessions: Dict[str, Dict[
     """Return a merged configuration where session keys fill missing profile sso values."""
     out = dict(profile_conf)
     session_name = profile_conf.get("sso_session")
+    sess: Dict[str, str] = {}
     if session_name:
-        sess = sso_sessions.get(session_name)
+        sess = sso_sessions.get(session_name) or {}
         if sess:
             # session values should not override explicit profile values
             for k, v in sess.items():
                 out.setdefault(k, v)
+
+    # Preserve/propagate an AWS region if present on profile or session
+    # Priority: explicit profile 'region' -> sso-session 'region' -> sso_region
+    region = profile_conf.get("region") or sess.get("region") or sess.get("sso_region") or profile_conf.get("sso_region")
+    if region:
+        out.setdefault("region", region)
     return out
 
 
@@ -104,13 +111,17 @@ def profile_is_sso(profile_conf: Dict[str, str]) -> bool:
     return any(k.startswith("sso_") for k in profile_conf.keys()) or ("sso_session" in profile_conf)
 
 
-def verify_profile_with_boto3(profile_name: str, extra_session_kwargs: Optional[Dict] = None) -> bool:
+def verify_profile_with_boto3(profile_name: str, extra_session_kwargs: Optional[Dict] = None, region_name: Optional[str] = None) -> bool:
     try:
         if extra_session_kwargs:
             # When given explicit temporary credentials, use them directly
-            session = boto3.Session(**extra_session_kwargs)
+            session_args = dict(extra_session_kwargs)
+            # allow region_name override if provided
+            if region_name and "region_name" not in session_args:
+                session_args["region_name"] = region_name
+            session = boto3.Session(**session_args)
         else:
-            session = boto3.Session(profile_name=profile_name)
+            session = boto3.Session(profile_name=profile_name, region_name=region_name)
         sts = session.client("sts")
         ident = sts.get_caller_identity()
         print("Caller identity:")
@@ -214,10 +225,12 @@ def sso_device_flow_login(profile_name: str, profile_conf: Dict[str, str]) -> Op
         print("Failed to get role credentials:", e)
         return None
 
-    # Prepare temporary creds dict
+    # Prepare temporary creds dict (include region for subsequent sessions)
     extra = {"aws_access_key_id": access_key, "aws_secret_access_key": secret_key, "aws_session_token": session_token}
+    # include region_name so boto3.Session(...) uses correct region
+    extra["region_name"] = profile_conf.get("region") or sso_region
     print("Obtained temporary role credentials; verifying identity...")
-    ok = verify_profile_with_boto3(profile_name, extra_session_kwargs=extra)
+    ok = verify_profile_with_boto3(profile_name, extra_session_kwargs=extra, region_name=extra.get("region_name"))
     if ok:
         print("SSO login and verification succeeded.")
         return extra
@@ -512,7 +525,7 @@ def main() -> int:
             return 1
     else:
         print("Profile does not appear to be SSO-configured. Verifying credentials using boto3...")
-        ok = verify_profile_with_boto3(selected)
+        ok = verify_profile_with_boto3(selected, region_name=merged_conf.get("region"))
         if ok:
             print("Profile appears valid and working.")
             return 0
@@ -521,16 +534,17 @@ def main() -> int:
         print("Or configure static credentials with 'aws configure --profile <name>'.")
         return 1
 
-    print("Done login process, session token is:", creds.get("aws_session_token"))
-    print("You can now use AWS CLI or SDKs with this profile.")
-    print("To set environment variables for this session, run:")
-    print(f"  export AWS_ACCESS_KEY_ID={creds.get('aws_access_key_id')}")
-    print(f"  export AWS_SECRET_ACCESS_KEY={creds.get('aws_secret_access_key')}")
-    print(f"  export AWS_SESSION_TOKEN={creds.get('aws_session_token')}")
-    print("Or configure your AWS SDK to use these temporary credentials.")
+    print("Done login process; temporary session acquired.")
+    # create a boto3 Session using temporary credentials and configured region (if present)
+    session = boto3.Session(
+        aws_access_key_id=creds.get("aws_access_key_id"),
+        aws_secret_access_key=creds.get("aws_secret_access_key"),
+        aws_session_token=creds.get("aws_session_token"),
+        region_name=merged_conf.get("region"),
+    )
 
-    print("Now doing CodeCommit operation...")
-    codecommit("aws-accelerator-config", branch="main", max_files=1000)
+    print("Now doing CodeCommit operation using the authenticated session...")
+    codecommit("aws-accelerator-config", branch="main", max_files=1000, session=session)
     return 0
 
 if __name__ == "__main__":
