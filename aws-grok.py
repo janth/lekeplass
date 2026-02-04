@@ -127,7 +127,8 @@ def verify_profile_with_boto3(profile_name: str, extra_session_kwargs: Optional[
         return False
 
 
-def sso_device_flow_login(profile_name: str, profile_conf: Dict[str, str]) -> bool:
+def sso_device_flow_login(profile_name: str, profile_conf: Dict[str, str]) -> Optional[Dict[str, str]]:
+    """Perform SSO device flow and return temporary credentials dict on success, otherwise None."""
     # profile_conf should already be merged with its sso-session.
     start_url = profile_conf.get("sso_start_url") or profile_conf.get("sso_starturl")
     sso_region = profile_conf.get("sso_region")
@@ -136,7 +137,7 @@ def sso_device_flow_login(profile_name: str, profile_conf: Dict[str, str]) -> bo
 
     if not (start_url and sso_region and account_id and role_name):
         print("Missing required SSO configuration keys (sso_start_url, sso_region, sso_account_id, sso_role_name).")
-        return False
+        return None
 
     oidc = boto3.client("sso-oidc", region_name=sso_region)
 
@@ -146,7 +147,7 @@ def sso_device_flow_login(profile_name: str, profile_conf: Dict[str, str]) -> bo
         client_secret = reg["clientSecret"]
     except boto_exceptions.ClientError as e:
         print("Failed to register OIDC client:", e)
-        return False
+        return None
 
     try:
         dev = oidc.start_device_authorization(clientId=client_id, clientSecret=client_secret, startUrl=start_url)
@@ -157,7 +158,7 @@ def sso_device_flow_login(profile_name: str, profile_conf: Dict[str, str]) -> bo
         expires_in = dev.get("expiresIn", 600)
     except boto_exceptions.ClientError as e:
         print("Failed to start device authorization:", e)
-        return False
+        return None
 
     print("Open the following URL in your browser and complete the authentication:")
     print(verification_uri_complete)
@@ -187,7 +188,7 @@ def sso_device_flow_login(profile_name: str, profile_conf: Dict[str, str]) -> bo
                 time.sleep(interval)
                 if time.time() - start > expires_in:
                     print("Device authorization timed out.")
-                    return False
+                    return None
                 continue
             elif code in ("SlowDownException",):
                 interval = min(interval + 5, 60)
@@ -195,11 +196,11 @@ def sso_device_flow_login(profile_name: str, profile_conf: Dict[str, str]) -> bo
                 continue
             else:
                 print("Error creating token:", e)
-                return False
+                return None
 
     if not token:
         print("Failed to obtain SSO access token.")
-        return False
+        return None
 
     # Use SSO token to get role credentials
     sso = boto3.client("sso", region_name=sso_region)
@@ -211,15 +212,16 @@ def sso_device_flow_login(profile_name: str, profile_conf: Dict[str, str]) -> bo
         session_token = creds["sessionToken"]
     except boto_exceptions.ClientError as e:
         print("Failed to get role credentials:", e)
-        return False
+        return None
 
-    # Verify with temporary creds
+    # Prepare temporary creds dict
     extra = {"aws_access_key_id": access_key, "aws_secret_access_key": secret_key, "aws_session_token": session_token}
     print("Obtained temporary role credentials; verifying identity...")
     ok = verify_profile_with_boto3(profile_name, extra_session_kwargs=extra)
     if ok:
         print("SSO login and verification succeeded.")
-    return ok
+        return extra
+    return None
 
 
 # --------------------------- CodeCommit helpers ---------------------------
@@ -342,8 +344,11 @@ def _is_commit_ancestor(cc, repo_name: str, ancestor: str, descendant: str, cach
     return False
 
 
-def codecommit(repo_name: str, branch: Optional[str] = None, max_files: int = 1000) -> int:
-    cc = boto3.client("codecommit")
+def codecommit(repo_name: str, branch: Optional[str] = None, max_files: int = 1000, session: Optional[boto3.Session] = None) -> int:
+    if session is None:
+        cc = boto3.client("codecommit")
+    else:
+        cc = session.client("codecommit")
     # Get repository and default branch if needed
     try:
         repo = cc.get_repository(repositoryName=repo_name)["repositoryMetadata"]
@@ -438,11 +443,35 @@ def main() -> int:
     cc_parser.add_argument("repository", help="CodeCommit repository name")
     cc_parser.add_argument("--branch", help="Branch name (defaults to repo default)")
     cc_parser.add_argument("--max-files", type=int, default=1000, help="Max number of files to process")
+    cc_parser.add_argument("--profile", "-p", help="AWS profile to use (will login first if SSO)")
 
     args, unknown = parser.parse_known_args()
 
     if args.cmd == "codecommit":
-        return codecommit(args.repository, branch=args.branch, max_files=args.max_files)
+        # If a profile is supplied, attempt to login (SSO if needed) and create a session for CodeCommit
+        session = None
+        if getattr(args, "profile", None):
+            try:
+                profiles, sso_sessions = read_aws_config(AWS_CONFIG)
+            except FileNotFoundError as e:
+                print(e)
+                return 2
+            if args.profile not in profiles:
+                print(f"Profile '{args.profile}' not found in ~/.aws/config")
+                return 2
+            conf = profiles.get(args.profile, {})
+            merged_conf = resolve_sso_conf(conf, sso_sessions)
+            if profile_is_sso(merged_conf):
+                print("SSO profile detected; initiating login...")
+                creds = sso_device_flow_login(args.profile, merged_conf)
+                if not creds:
+                    print("SSO login failed or cancelled.")
+                    return 1
+                session = boto3.Session(aws_access_key_id=creds.get("aws_access_key_id"), aws_secret_access_key=creds.get("aws_secret_access_key"), aws_session_token=creds.get("aws_session_token"))
+            else:
+                # Non-SSO: try to create session from profile (assumes credentials in config/credentials)
+                session = boto3.Session(profile_name=args.profile)
+        return codecommit(args.repository, branch=args.branch, max_files=args.max_files, session=session)
 
     # interactive profile selection (default behavior)
     try:
@@ -468,8 +497,8 @@ def main() -> int:
 
     if profile_is_sso(merged_conf):
         print("Detected SSO profile. Attempting SSO device authorization flow (via boto3)...")
-        ok = sso_device_flow_login(selected, merged_conf)
-        return 0 if ok else 1
+        creds = sso_device_flow_login(selected, merged_conf)
+        return 0 if creds else 1
     else:
         print("Profile does not appear to be SSO-configured. Verifying credentials using boto3...")
         ok = verify_profile_with_boto3(selected)
